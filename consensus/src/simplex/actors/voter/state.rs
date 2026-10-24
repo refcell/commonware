@@ -429,6 +429,10 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
                 } else {
                     target
                 };
+                // Staying put needs no election (the wanted view is recorded).
+                if target <= self.view {
+                    return false;
+                }
                 // Entering a view below the one we hold a certificate for needs
                 // its leader. Scheduled electors can elect it without the
                 // unlocking certificate; otherwise skip the gate (catch-up only).
