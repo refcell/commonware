@@ -694,6 +694,7 @@ cfg_if::cfg_if! {
         mod engine;
         pub use engine::Engine;
         mod metrics;
+        pub mod multi;
 
         /// The window of views an actor tracks, bounded below by retention
         /// and above by admission policy.
@@ -867,6 +868,8 @@ mod tests {
     };
     use tracing::{debug, info, warn};
     use types::Activity;
+
+    mod multi_leader;
 
     // Invoke `$cb!($($args)*, $suffix, $elector, $fixture, $elector_config)`
     // once per canonical (elector, scheme) fixture.

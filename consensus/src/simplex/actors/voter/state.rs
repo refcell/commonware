@@ -4,6 +4,7 @@ use crate::{
     simplex::{
         Floor, Lookahead, Viewport,
         actors::span::MISSING_SPAN,
+        multi::Gate,
         elector::{Elector, Mode as _},
         metrics::{HandoffAbandonedReason, Leader, Timeout, TimeoutReason},
         scheme::Scheme,
@@ -172,6 +173,10 @@ pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D:
     view: View,
     last_finalized: View,
     genesis: Option<D>,
+
+    /// Shared view clock handle when this state machine drives one lane of a
+    /// multi-leader engine. `None` keeps single-leader behavior.
+    gate: Option<Gate>,
     views: BTreeMap<View, Round<S, D>>,
 
     /// Monotone cursor for the oldest entered, unfinalized view (the anchor of
@@ -276,6 +281,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
             view: GENESIS_VIEW,
             last_finalized: GENESIS_VIEW,
             genesis: None,
+            gate: None,
             views: BTreeMap::new(),
             stall_anchor: GENESIS_VIEW,
             nullify_views: BTreeSet::new(),
@@ -372,8 +378,46 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         self.scheme.me().is_some_and(|me| me == idx)
     }
 
+    /// Attaches a multi-leader view gate.
+    ///
+    /// With a gate, the state machine publishes every view it would enter and
+    /// only enters views the shared clock allows (see [`Self::enter_view`]).
+    pub fn set_gate(&mut self, gate: Gate) {
+        self.gate = Some(gate);
+    }
+
+    /// Returns true when a gate holds this lane below the view it wants to enter.
+    pub fn is_gated(&self) -> bool {
+        self.gate
+            .as_ref()
+            .is_some_and(|gate| gate.wanted() > self.view)
+    }
+
+    /// Enters the highest view the gate now allows, if it is above the current view.
+    ///
+    /// Returns true if the view advanced.
+    pub fn retry_gated_entry(&mut self) -> bool {
+        let Some(gate) = self.gate.as_ref() else {
+            return false;
+        };
+        let wanted = gate.wanted();
+        self.enter_view(wanted)
+    }
+
     /// Advances the view.
+    ///
+    /// With a gate, `view` is first recorded as the view this lane wants, and
+    /// the lane enters `min(view, max(shared, last_finalized))`: it never passes
+    /// the shared view of all lanes, except to catch up to its own finalized
+    /// view (it never sits below a view it has finalized).
     fn enter_view(&mut self, view: View) -> bool {
+        let view = match self.gate.as_ref() {
+            Some(gate) => {
+                let shared = gate.want(view);
+                view.min(shared.max(self.last_finalized))
+            }
+            None => view,
+        };
         if view <= self.view {
             return false;
         }
@@ -457,6 +501,19 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         }
     }
 
+    /// Returns the next timeout deadline, or `None` while a gate holds this lane
+    /// in a resolved view that has no round-local timeout left.
+    pub fn next_deadline(&mut self) -> Option<(SystemTime, TimeoutReason)> {
+        if self.is_gated() {
+            let now = self.context.current();
+            let timeout_retry = self.timeout_retry;
+            let allow_latched_timeout = self.has_skip_budget();
+            let round = self.views.get_mut(&self.view)?;
+            round.next_timeout(now, timeout_retry, allow_latched_timeout)?;
+        }
+        Some(self.next_timeout())
+    }
+
     /// Returns the next timeout deadline and its reason.
     pub fn next_timeout(&mut self) -> (SystemTime, TimeoutReason) {
         let now = self.context.current();
@@ -499,9 +556,17 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         let term_length = self.term_length();
         let first_unfinalized = self.last_finalized.next().term_index(term_length);
         let current = self.view.term_index(term_length);
-        let spent = current
-            .checked_sub(first_unfinalized)
-            .expect("current term must not precede the first unfinalized term");
+        let spent = match current.checked_sub(first_unfinalized) {
+            Some(spent) => spent,
+            None => {
+                // A gated lane may wait in the view it just finalized.
+                assert!(
+                    self.gate.is_some(),
+                    "current term must not precede the first unfinalized term"
+                );
+                0
+            }
+        };
         spent < self.skip_budget
     }
 

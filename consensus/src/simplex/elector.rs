@@ -419,6 +419,60 @@ impl<S: Scheme> Elector<S> for RoundRobinElector<S> {
     }
 }
 
+/// Offsets the leader chosen by an inner elector by a fixed amount.
+///
+/// Used by multi-leader consensus to elect one leader per lane: lane `l` uses
+/// `LaneOffset::new(inner, l)`, so in every round the lanes are led by
+/// `inner + l (mod n)`, which are distinct participants whenever there are at
+/// least as many participants as lanes.
+#[derive(Clone, Debug)]
+pub struct LaneOffset<C> {
+    inner: C,
+    offset: u32,
+}
+
+impl<C> LaneOffset<C> {
+    /// Wraps `inner`, adding `offset` to every elected participant index.
+    pub const fn new(inner: C, offset: u32) -> Self {
+        Self { inner, offset }
+    }
+}
+
+impl<S: Scheme, C: Config<S>> Config<S> for LaneOffset<C> {
+    type Elector = LaneOffsetElector<C::Elector>;
+
+    fn build(self, participants: &Set<S::PublicKey>) -> Self::Elector {
+        let n = u32::try_from(participants.len()).expect("participant count fits in u32");
+        LaneOffsetElector {
+            inner: self.inner.build(participants),
+            offset: self.offset,
+            n,
+        }
+    }
+}
+
+/// Initialized [`LaneOffset`] elector.
+#[derive(Clone, Debug)]
+pub struct LaneOffsetElector<E> {
+    inner: E,
+    offset: u32,
+    n: u32,
+}
+
+impl<S: Scheme, E: Elector<S>> Elector<S> for LaneOffsetElector<E> {
+    type Mode = E::Mode;
+
+    fn terms(&self) -> Terms {
+        self.inner.terms()
+    }
+
+    fn elect(&self, round: Round, input: Input<'_, S, Self>) -> Participant {
+        let base = u64::from(self.inner.elect(round, input).get());
+        let idx = (base + u64::from(self.offset)) % u64::from(self.n);
+        Participant::new(u32::try_from(idx).expect("index below participant count"))
+    }
+}
+
 /// Signature-to-leader mapping used by [`Random`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RandomVersion {

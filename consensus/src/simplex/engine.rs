@@ -6,7 +6,8 @@ use super::{
 };
 use crate::{
     CertifiableAutomaton, Relay, Reporter,
-    simplex::{Lookahead, Plan, scheme::Scheme},
+    simplex::{Lookahead, Plan, multi::Gate, scheme::Scheme},
+    types::TermLength,
 };
 use commonware_cryptography::Digest;
 use commonware_macros::select;
@@ -53,7 +54,17 @@ impl<
 > Engine<E, S, L, B, D, A, R, F, T>
 {
     /// Create a new `simplex` consensus engine.
-    pub fn new(mut context: E, cfg: Config<S, L, B, D, A, R, F, T>) -> Self {
+    pub fn new(context: E, cfg: Config<S, L, B, D, A, R, F, T>) -> Self {
+        Self::new_gated(context, cfg, None)
+    }
+
+    /// Create an engine that drives one lane of a multi-leader engine, entering
+    /// views only as the shared [`Gate`] allows.
+    pub(crate) fn new_gated(
+        mut context: E,
+        cfg: Config<S, L, B, D, A, R, F, T>,
+        gate: Option<Gate>,
+    ) -> Self {
         // Ensure configuration is valid
         cfg.assert(&mut context);
         let skip_budget = match cfg.skip {
@@ -63,6 +74,17 @@ impl<
         let elector = cfg.elector.build(cfg.scheme.participants());
         let terms = elector.terms();
         let term_length = terms.length();
+        if gate.is_some() {
+            assert_eq!(
+                term_length,
+                TermLength::ONE,
+                "multi-leader lanes require rotating terms"
+            );
+            assert!(
+                matches!(cfg.skip, SkipPolicy::Disabled),
+                "multi-leader lanes require a disabled skip policy"
+            );
+        }
         if let Some(stall_timeout) = terms.stall_timeout() {
             assert!(
                 stall_timeout > cfg.certification_timeout,
@@ -91,7 +113,7 @@ impl<
         );
 
         // Create voter
-        let (voter, voter_mailbox) = voter::Actor::new(
+        let (mut voter, voter_mailbox) = voter::Actor::new(
             context.child("voter"),
             voter::Config {
                 scheme: cfg.scheme.clone(),
@@ -114,6 +136,10 @@ impl<
                 page_cache: cfg.page_cache,
             },
         );
+
+        if let Some(gate) = gate {
+            voter.set_gate(gate);
+        }
 
         // Create resolver
         let (resolver, resolver_mailbox) = resolver::Actor::new(

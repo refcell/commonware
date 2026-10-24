@@ -9,6 +9,7 @@ use crate::{
         Floor, Plan,
         actors::{Kind, batcher, resolver},
         elector::Elector,
+        multi::Gate,
         metrics::{
             self, HandoffAbandoned, HandoffAbandonedReason, HandoffEvent, HandoffEventKind,
             Outbound, TimeoutReason,
@@ -37,7 +38,7 @@ use commonware_runtime::{
 };
 use commonware_storage::journal::segmented::variable::{Config as JConfig, Journal};
 use commonware_utils::{
-    channel::oneshot,
+    channel::{oneshot, watch},
     futures::{AbortablePool, rebind},
 };
 use core::{
@@ -169,6 +170,7 @@ pub struct Actor<
     dirty_section: Option<View>,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
+    gate_rx: Option<watch::Receiver<View>>,
 
     outbound_messages: CounterFamily<Outbound>,
     handoff_events: CounterFamily<HandoffEvent>,
@@ -258,6 +260,7 @@ impl<
                 mailbox_receiver,
 
                 outbound_messages,
+                gate_rx: None,
                 handoff_events,
                 handoff_abandoned,
                 notarization_latency,
@@ -267,6 +270,12 @@ impl<
             },
             mailbox,
         )
+    }
+
+    /// Attaches a multi-leader view gate (see [`crate::simplex::multi`]).
+    pub(crate) fn set_gate(&mut self, gate: Gate) {
+        self.gate_rx = Some(gate.subscribe());
+        self.state.set_gate(gate);
     }
 
     /// Returns the wall-clock seconds since we proposed in `view` (or entered
@@ -1306,7 +1315,11 @@ impl<
                 let certify_wait = certify_pool.next_completed();
 
                 // Wait for a timeout to fire or for a message to arrive
-                let (deadline, reason) = self.state.next_timeout();
+                // A gated lane in a resolved view has no deadline and waits for the gate.
+                let (deadline, reason) = match self.state.next_deadline() {
+                    Some((deadline, reason)) => (Some(deadline), reason),
+                    None => (None, TimeoutReason::LeaderTimeout),
+                };
                 let start = self.state.current_view();
                 let mut nullify = None;
                 let mut certification = None;
@@ -1315,7 +1328,12 @@ impl<
             on_stopped => {
                 debug!("context shutdown, stopping voter");
             },
-            _ = self.context.sleep_until(deadline) => {
+            _ = gate_advanced(&mut self.gate_rx) => {
+                // The shared view advanced: enter the view this lane was waiting for.
+                self.state.retry_gated_entry();
+                view = self.state.current_view();
+            },
+            _ = sleep_until_some(&*self.context, deadline) => {
                 // Process the timeout (the constructed nullify is staged for the broadcast phase)
                 let current_view = self.state.current_view();
                 let span = info_span!(
@@ -1510,5 +1528,23 @@ impl<
             .sync_all()
             .await
             .expect("unable to sync journal");
+    }
+}
+
+/// Resolves when the shared view of a multi-leader gate advances (never without a gate).
+async fn gate_advanced(rx: &mut Option<watch::Receiver<View>>) {
+    if let Some(rx) = rx
+        && rx.changed().await.is_ok()
+    {
+        return;
+    }
+    pending().await
+}
+
+/// Sleeps until `deadline`, or forever when there is none.
+async fn sleep_until_some<C: Clock>(context: &C, deadline: Option<std::time::SystemTime>) {
+    match deadline {
+        Some(deadline) => context.sleep_until(deadline).await,
+        None => pending().await,
     }
 }
