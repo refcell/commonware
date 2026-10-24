@@ -429,3 +429,46 @@ fn test_lane_leaders_are_distinct_and_rotate() {
         assert_eq!(next, (base + 1) % 4);
     }
 }
+
+#[test_traced]
+fn test_multi_leader_partitioned_validator_recovers() {
+    runner(4).start(|mut context| async move {
+        let mut net = Net::new(&mut context, 4, 3).await;
+        let mut all = Vec::new();
+        let mut clocks = Vec::new();
+        for idx in 0..4 {
+            let (_, reporters, clock) = net.start(&context, idx, &[]).await;
+            all.push(reporters);
+            clocks.push(clock);
+        }
+        wait_finalized(&context, &all.concat(), View::new(10)).await;
+
+        // Cut validator 1 off: the other three keep finalizing every lane.
+        let isolated = |_: usize, i: usize, j: usize| i == 1 || j == 1;
+        link_validators(&mut net.oracle, &net.participants, Action::Unlink, Some(isolated)).await;
+        let majority: Vec<_> = [0, 2, 3]
+            .iter()
+            .flat_map(|idx| all[*idx].iter().cloned())
+            .collect();
+        wait_finalized(&context, &majority, View::new(30)).await;
+        let stalled = clocks[1].current();
+        assert!(stalled < View::new(30), "isolated validator kept advancing");
+
+        // Heal: the isolated validator catches up on every lane.
+        let link = Link {
+            latency: Duration::from_millis(50),
+            jitter: Duration::from_millis(5),
+            success_rate: probability!(1.0),
+        };
+        link_validators(
+            &mut net.oracle,
+            &net.participants,
+            Action::Link(link),
+            Some(isolated),
+        )
+        .await;
+        wait_finalized(&context, &all.concat(), View::new(50)).await;
+        assert_safe(&all);
+        assert!(clocks[1].current() >= View::new(50));
+    });
+}
