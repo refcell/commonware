@@ -407,14 +407,28 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     /// Advances the view.
     ///
     /// With a gate, `view` is first recorded as the view this lane wants, and
-    /// the lane enters `min(view, max(shared, last_finalized))`: it never passes
-    /// the shared view of all lanes, except to catch up to its own finalized
-    /// view (it never sits below a view it has finalized).
+    /// the lane enters `min(view, shared)`: it never passes the shared view of
+    /// all lanes, except to catch up to the view after its own last finalized
+    /// view. A lane that finalizes its current view while gated stays in it.
     fn enter_view(&mut self, view: View) -> bool {
         let view = match self.gate.as_ref() {
             Some(gate) => {
                 let shared = gate.want(view);
-                view.min(shared.max(self.last_finalized))
+                // Never enter a decided view: a lane catching up past the shared
+                // view enters the view after its last finalized view.
+                let target = if shared > self.last_finalized {
+                    view.min(shared)
+                } else {
+                    view.min(self.last_finalized.next())
+                };
+                // Entering a view below the one we hold a certificate for needs
+                // its leader. Scheduled electors can elect it without the
+                // unlocking certificate; otherwise skip the gate (catch-up only).
+                if target < view && !self.elect_early(target) {
+                    view
+                } else {
+                    target
+                }
             }
             None => view,
         };
@@ -458,6 +472,20 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
             .elector
             .elect(Rnd::new(self.epoch, view), L::Mode::input(certificate));
         self.create_round(view).set_leader(leader);
+    }
+
+    /// Sets the leader of `view` without its unlocking certificate when the
+    /// elector allows it. Returns whether the leader is set.
+    fn elect_early(&mut self, view: View) -> bool {
+        if self.leader_is_set(view) {
+            return true;
+        }
+        let Some(input) = L::Mode::early() else {
+            return false;
+        };
+        let leader = self.elector.elect(Rnd::new(self.epoch, view), input);
+        self.create_round(view).set_leader(leader);
+        true
     }
 
     /// Copies the same-term stable leader into an optimistic successor whose leader is unset.

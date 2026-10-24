@@ -4,13 +4,15 @@ use crate::{
     simplex::{
         Plan,
         config::{self, Floor, ForwardPolicy, SkipPolicy},
-        elector::{self, LaneOffset},
+        elector::{self, Elector, LaneOffset, LaneOffsetElector, Mode},
         engine,
         scheme::Scheme,
         types::{Activity, Context},
     },
-    types::{Epoch, ViewDelta},
+    types::{Epoch, Participant, Round, ViewDelta},
 };
+use commonware_cryptography::certificate;
+use commonware_utils::ordered::Set;
 use commonware_actor::Feedback;
 use commonware_cryptography::Digest;
 use commonware_macros::select;
@@ -34,6 +36,42 @@ pub fn lane_namespace(base: &[u8], lane: LaneId) -> Vec<u8> {
     namespace.extend_from_slice(b"_LANE_");
     namespace.extend_from_slice(&lane.to_be_bytes());
     namespace
+}
+
+/// Leader schedule of every lane (for telemetry).
+///
+/// Uses the same lane electors as [`Engine`], so `leader(round, lane)` is the
+/// participant index that leads `lane` in `round`.
+#[derive(Clone)]
+pub struct LaneLeaders<S: certificate::Scheme, L: elector::Config<S>> {
+    lanes: Vec<<LaneOffset<L> as elector::Config<S>>::Elector>,
+}
+
+impl<S: certificate::Scheme, L: elector::Config<S>> LaneLeaders<S, L> {
+    /// Builds the schedule for `lanes` lanes over `participants`.
+    pub fn new(elector: L, participants: &Set<S::PublicKey>, lanes: u16) -> Self {
+        Self {
+            lanes: (0..lanes)
+                .map(|lane| {
+                    elector::Config::<S>::build(
+                        LaneOffset::new(elector.clone(), u32::from(lane)),
+                        participants,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Returns the leader of `lane` in `round`, or `None` if the elector needs
+    /// the round's unlocking certificate (not the case for [`elector::RoundRobin`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lane` is out of range.
+    pub fn leader(&self, round: Round, lane: LaneId) -> Option<Participant> {
+        let input = <<LaneOffsetElector<L::Elector> as Elector<S>>::Mode as Mode>::early()?;
+        Some(self.lanes[lane as usize].elect(round, input))
+    }
 }
 
 /// A reporter event of one lane.

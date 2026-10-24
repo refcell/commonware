@@ -11,4 +11,4 @@ mod gate;
 pub use gate::{Gate, LaneId, ViewClock};
 
 mod engine;
-pub use engine::{Config, Engine, Lane, LaneActivity, Tagged, lane_namespace};
+pub use engine::{Config, Engine, Lane, LaneActivity, LaneLeaders, Tagged, lane_namespace};
