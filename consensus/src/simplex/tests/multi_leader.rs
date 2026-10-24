@@ -472,3 +472,82 @@ fn test_multi_leader_partitioned_validator_recovers() {
         assert!(clocks[1].current() >= View::new(50));
     });
 }
+
+#[test_traced]
+fn test_multi_leader_recovers_after_lossy_network() {
+    runner(5).start(|mut context| async move {
+        let mut net = Net::new(&mut context, 4, 3).await;
+        let mut all = Vec::new();
+        let mut clocks = Vec::new();
+        for idx in 0..4 {
+            let (_, reporters, clock) = net.start(&context, idx, &[]).await;
+            all.push(reporters);
+            clocks.push(clock);
+        }
+        wait_finalized(&context, &all.concat(), View::new(5)).await;
+
+        // Drop most messages for a while: lanes desynchronize across validators
+        // and certificates are lost.
+        let link = |success_rate| Link {
+            latency: Duration::from_millis(50),
+            jitter: Duration::from_millis(5),
+            success_rate,
+        };
+        link_validators(
+            &mut net.oracle,
+            &net.participants,
+            Action::Update(link(probability!(0.3))),
+            None,
+        )
+        .await;
+        context.sleep(Duration::from_secs(60)).await;
+
+        // Heal: every lane on every validator makes progress again.
+        link_validators(
+            &mut net.oracle,
+            &net.participants,
+            Action::Update(link(probability!(1.0))),
+            None,
+        )
+        .await;
+        let healed = clocks.iter().map(|clock| clock.current()).max().unwrap();
+        wait_finalized(&context, &all.concat(), healed.saturating_add(ViewDelta::new(20))).await;
+        assert_safe(&all);
+    });
+}
+
+#[test]
+fn test_lane_signatures_do_not_verify_on_other_lanes() {
+    let Fixture {
+        participants,
+        private_keys,
+        ..
+    } = ed25519::fixture(&mut test_rng(), NAMESPACE, 4);
+    let set: Set<PublicKey> = participants.try_into().unwrap();
+    let lane_schemes = |lane: LaneId| -> Vec<ed25519::Scheme> {
+        private_keys
+            .iter()
+            .map(|key| {
+                ed25519::Scheme::signer(&multi::lane_namespace(NAMESPACE, lane), set.clone(), key.clone())
+                    .unwrap()
+            })
+            .collect()
+    };
+    let (lane0, lane1) = (lane_schemes(0), lane_schemes(1));
+    let proposal = Proposal::new(
+        Round::new(EPOCH, View::new(3)),
+        View::new(2),
+        Sha256Digest::from([1; 32]),
+    );
+    let notarizes: Vec<_> = lane0
+        .iter()
+        .map(|scheme| TNotarize::sign(scheme, proposal.clone()).unwrap())
+        .collect();
+    let notarization =
+        TNotarization::from_notarizes(&lane0[0], non_empty![@&notarizes], &Sequential).unwrap();
+    let mut rng = test_rng();
+    assert!(notarizes[0].verify(&mut rng, &lane0[1], &Sequential));
+    assert!(!notarizes[0].verify(&mut rng, &lane1[1], &Sequential));
+    assert!(notarization.verify(&mut rng, &lane0[1], &Sequential));
+    assert!(!notarization.verify(&mut rng, &lane1[1], &Sequential));
+}

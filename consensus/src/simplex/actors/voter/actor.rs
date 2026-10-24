@@ -625,7 +625,11 @@ impl<
         //
         // We don't worry about recording this certificate because it must've already existed (and thus
         // we must've already broadcast and persisted it).
-        let entry = self.state.get_best_certificate();
+        // A gated lane includes the certificate that resolved its current view.
+        let entry = self
+            .state
+            .gated_certificate()
+            .or_else(|| self.state.get_best_certificate());
         (self, Some((nullify, entry)))
     }
 
@@ -1318,7 +1322,7 @@ impl<
                 // A gated lane in a resolved view has no deadline and waits for the gate.
                 let (deadline, reason) = match self.state.next_deadline() {
                     Some((deadline, reason)) => (Some(deadline), reason),
-                    None => (None, TimeoutReason::LeaderTimeout),
+                    None => (None, None),
                 };
                 let start = self.state.current_view();
                 let mut nullify = None;
@@ -1334,16 +1338,21 @@ impl<
                 view = self.state.current_view();
             },
             _ = sleep_until_some(&*self.context, deadline) => {
-                // Process the timeout (the constructed nullify is staged for the broadcast phase)
                 let current_view = self.state.current_view();
-                let span = info_span!(
-                    parent: self.state.view_span(current_view),
-                    "simplex.voter.timeout",
-                    epoch = self.state.epoch().traced(),
-                    view = current_view.traced(),
-                    reason = reason.as_str()
-                );
-                (self, nullify) = self.timeout(reason).instrument(span).await;
+                if let Some(reason) = reason {
+                    // Process the timeout (the constructed nullify is staged for the broadcast phase)
+                    let span = info_span!(
+                        parent: self.state.view_span(current_view),
+                        "simplex.voter.timeout",
+                        epoch = self.state.epoch().traced(),
+                        view = current_view.traced(),
+                        reason = reason.as_str()
+                    );
+                    (self, nullify) = self.timeout(reason).instrument(span).await;
+                } else if let Some(certificate) = self.state.gated_certificate() {
+                    // Gated in a resolved view: rebroadcast its certificate.
+                    self.broadcast_certificate(&mut certificate_sender, certificate);
+                }
                 view = self.state.current_view();
             },
             (request, span, proposed) = propose_wait => {

@@ -177,6 +177,9 @@ pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D:
     /// Shared view clock handle when this state machine drives one lane of a
     /// multi-leader engine. `None` keeps single-leader behavior.
     gate: Option<Gate>,
+    /// Next rebroadcast of the current view's certificate while gated in a
+    /// view that has no round timeout.
+    gated_rebroadcast: Option<SystemTime>,
     views: BTreeMap<View, Round<S, D>>,
 
     /// Monotone cursor for the oldest entered, unfinalized view (the anchor of
@@ -282,6 +285,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
             last_finalized: GENESIS_VIEW,
             genesis: None,
             gate: None,
+            gated_rebroadcast: None,
             views: BTreeMap::new(),
             stall_anchor: GENESIS_VIEW,
             nullify_views: BTreeSet::new(),
@@ -408,18 +412,22 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     ///
     /// With a gate, `view` is first recorded as the view this lane wants, and
     /// the lane enters `min(view, shared)`: it never passes the shared view of
-    /// all lanes, except to catch up to the view after its own last finalized
-    /// view. A lane that finalizes its current view while gated stays in it.
+    /// all lanes, except that a lane below its own last finalized view catches
+    /// up to the view after it. A lane that finalizes its current view while
+    /// gated stays in it.
     fn enter_view(&mut self, view: View) -> bool {
         let view = match self.gate.as_ref() {
             Some(gate) => {
                 let shared = gate.want(view);
-                // Never enter a decided view: a lane catching up past the shared
-                // view enters the view after its last finalized view.
-                let target = if shared > self.last_finalized {
-                    view.min(shared)
-                } else {
+                // Never pass the shared view, except to catch up: a lane below
+                // its last finalized view (after replay or sync) enters the view
+                // after it instead of a decided view.
+                let target = view.min(shared);
+                let target = if target <= self.last_finalized && self.view < self.last_finalized
+                {
                     view.min(self.last_finalized.next())
+                } else {
+                    target
                 };
                 // Entering a view below the one we hold a certificate for needs
                 // its leader. Scheduled electors can elect it without the
@@ -435,6 +443,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         if view <= self.view {
             return false;
         }
+        self.gated_rebroadcast = None;
 
         let now = self.context.current();
         let leader_deadline = now + self.leader_timeout;
@@ -531,15 +540,48 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
 
     /// Returns the next timeout deadline, or `None` while a gate holds this lane
     /// in a resolved view that has no round-local timeout left.
-    pub fn next_deadline(&mut self) -> Option<(SystemTime, TimeoutReason)> {
+    ///
+    /// A gated lane whose round has no timeout returns its next certificate
+    /// rebroadcast with reason `None` instead (see [`Self::gated_certificate`]).
+    pub fn next_deadline(&mut self) -> Option<(SystemTime, Option<TimeoutReason>)> {
         if self.is_gated() {
             let now = self.context.current();
             let timeout_retry = self.timeout_retry;
             let allow_latched_timeout = self.has_skip_budget();
             let round = self.views.get_mut(&self.view)?;
-            round.next_timeout(now, timeout_retry, allow_latched_timeout)?;
+            if round
+                .next_timeout(now, timeout_retry, allow_latched_timeout)
+                .is_none()
+            {
+                let at = *self.gated_rebroadcast.get_or_insert(now + timeout_retry);
+                return Some((at, None));
+            }
         }
-        Some(self.next_timeout())
+        let (deadline, reason) = self.next_timeout();
+        Some((deadline, Some(reason)))
+    }
+
+    /// Returns the certificate that resolves the current view while gated
+    /// (finalization, then notarization, then nullification) and schedules the
+    /// next rebroadcast.
+    ///
+    /// Peers that missed it cannot enter the next view, and the resolver only
+    /// repairs gaps below certificates it has seen, so a gated lane
+    /// periodically rebroadcasts it.
+    pub fn gated_certificate(&mut self) -> Option<Certificate<S, D>> {
+        if !self.is_gated() {
+            return None;
+        }
+        self.gated_rebroadcast = Some(self.context.current() + self.timeout_retry);
+        let view = self.view;
+        if let Some(finalization) = self.finalization(view) {
+            return Some(Certificate::Finalization(finalization.clone()));
+        }
+        if let Some(notarization) = self.notarization(view) {
+            return Some(Certificate::Notarization(notarization.clone()));
+        }
+        self.nullification(view)
+            .map(|nullification| Certificate::Nullification(nullification.clone()))
     }
 
     /// Returns the next timeout deadline and its reason.
@@ -2109,6 +2151,80 @@ mod tests {
             .collect();
         Finalization::from_finalizes(verifier, non_empty![@votes.iter()], &Sequential)
             .expect("finalization")
+    }
+
+    #[test_traced]
+    fn gated_lane_stays_in_finalized_current_view() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let (fixture, mut state) = setup_state_with(
+                &mut context,
+                4,
+                0,
+                1,
+                10,
+                TermLength::ONE,
+                ViewDelta::new(1),
+                0,
+            );
+            let clock = crate::simplex::multi::ViewClock::new(2);
+            state.set_gate(clock.gate(0));
+            let other = clock.gate(1);
+
+            // Finalizing the current view while the other lane is unresolved
+            // must not pass the shared view.
+            let proposal = propose_and_notarize_view1(&mut state, 7);
+            let finalization = build_finalization(&fixture.verifier, &fixture.schemes, &proposal);
+            assert!(state.add_finalization(finalization).0);
+            assert_eq!(state.current_view(), View::new(1));
+            assert!(state.is_gated());
+            assert!(matches!(
+                state.next_deadline(),
+                Some((_, None))
+            ));
+            assert!(matches!(
+                state.gated_certificate(),
+                Some(Certificate::Finalization(_))
+            ));
+
+            // The other lane resolves view 1: the gate opens.
+            other.want(View::new(2));
+            assert!(state.retry_gated_entry());
+            assert_eq!(state.current_view(), View::new(2));
+            assert!(!state.is_gated());
+            assert!(matches!(state.next_deadline(), Some((_, Some(_)))));
+        });
+    }
+
+    #[test_traced]
+    fn gated_lane_catches_up_past_shared_view() {
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let (fixture, mut state) = setup_state_with(
+                &mut context,
+                4,
+                0,
+                1,
+                10,
+                TermLength::ONE,
+                ViewDelta::new(1),
+                0,
+            );
+            let clock = crate::simplex::multi::ViewClock::new(2);
+            state.set_gate(clock.gate(0));
+
+            // A finalization above the current view (sync or replay) enters the
+            // view after it even though the other lane is still at view 1.
+            let proposal = Proposal::new(
+                Rnd::new(state.epoch(), View::new(5)),
+                View::new(4),
+                Sha256Digest::from([9; 32]),
+            );
+            let finalization = build_finalization(&fixture.verifier, &fixture.schemes, &proposal);
+            assert!(state.add_finalization(finalization).0);
+            assert_eq!(state.current_view(), View::new(6));
+            assert_eq!(clock.current(), View::new(1));
+        });
     }
 
     #[test_traced]
